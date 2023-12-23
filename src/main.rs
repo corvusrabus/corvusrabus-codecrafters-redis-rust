@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+mod command;
+mod state;
+
 use std::str::{from_utf8, FromStr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // Uncomment this block to pass the first stage
+use crate::state::{RedisState, ValueState};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
@@ -15,12 +18,8 @@ pub enum RedisMessage {
 impl RedisMessage {
     fn to_message(&self) -> String {
         match self {
-            RedisMessage::Array(array) => {
-                array.to_message()
-            }
-            RedisMessage::BulkString(bulk) => {
-                bulk.to_message()
-            }
+            RedisMessage::Array(array) => array.to_message(),
+            RedisMessage::BulkString(bulk) => bulk.to_message(),
         }
     }
     fn parse_slice(slice: &[u8], start: usize) -> Result<(Self, usize), String> {
@@ -37,9 +36,7 @@ impl RedisMessage {
                 // println!("Parsed string {string:?}");
                 Ok((Self::BulkString(string), end))
             }
-            _ => {
-                Err(format!("unrecognised symbol {symbol}"))
-            }
+            _ => Err(format!("unrecognised symbol {symbol}")),
         }
     }
 }
@@ -69,7 +66,9 @@ pub struct RedisBulkStringMessage {
 
 impl From<String> for RedisBulkStringMessage {
     fn from(content: String) -> Self {
-        Self { content: Some(content) }
+        Self {
+            content: Some(content),
+        }
     }
 }
 
@@ -82,7 +81,7 @@ impl From<Option<String>> for RedisBulkStringMessage {
 impl RedisBulkStringMessage {
     fn to_message(&self) -> String {
         match self.content.as_ref() {
-            None => { "$-1\r\n\r\n".to_string() }
+            None => "$-1\r\n\r\n".to_string(),
             Some(x) => {
                 format!("${}\r\n{}\r\n", x.len(), x)
             }
@@ -128,7 +127,7 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     //
     let mut buf = [0; 512];
-    let state: Arc<RwLock<HashMap<String, String>>> = Default::default();
+    let state: Arc<RwLock<RedisState>> = Default::default();
     loop {
         let stream = listener.accept().await;
         match stream {
@@ -142,38 +141,97 @@ async fn main() {
                             let (rcvd_msg, _) = RedisMessage::parse_slice(&buf[..size], 0).unwrap();
                             println!("{rcvd_msg:?}");
                             if let RedisMessage::Array(array) = rcvd_msg {
-                                if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content })) = array.messages.first() {
+                                if let Some(RedisMessage::BulkString(RedisBulkStringMessage {
+                                    content,
+                                })) = array.messages.first()
+                                {
                                     match content.as_ref().unwrap().to_uppercase().as_str() {
                                         "ECHO" => {
-                                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content })) = array.messages.get(1) {
-                                                let reply = RedisMessage::BulkString(content.clone().into()).to_message();
+                                            if let Some(RedisMessage::BulkString(
+                                                RedisBulkStringMessage { content },
+                                            )) = array.messages.get(1)
+                                            {
+                                                let reply = RedisMessage::BulkString(
+                                                    content.clone().into(),
+                                                )
+                                                .to_message();
                                                 println!("Sending message {reply}");
                                                 stream.write_all(reply.as_bytes()).await.unwrap();
                                                 continue;
                                             }
                                         }
                                         "GET" => {
-                                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content: Some(x) })) = array.messages.get(1) {
+                                            if let Some(RedisMessage::BulkString(
+                                                RedisBulkStringMessage { content: Some(x) },
+                                            )) = array.messages.get(1)
+                                            {
                                                 let value = {
-                                                    state_clone.read().await.get(x).cloned()
+                                                    // let's ignore deleting expired keys now
+                                                    state_clone
+                                                        .read()
+                                                        .await
+                                                        .get(x)
+                                                        .and_then(ValueState::value_after_expiry)
+                                                        .cloned()
                                                 };
-                                                println!("state_clone {:?}", state_clone.read().await);
-                                                let reply = RedisMessage::BulkString(value.into()).to_message();
+                                                println!(
+                                                    "state_clone {:?}",
+                                                    state_clone.read().await
+                                                );
+                                                let reply = RedisMessage::BulkString(value.into())
+                                                    .to_message();
                                                 println!("Sending message {reply}");
                                                 stream.write_all(reply.as_bytes()).await.unwrap();
                                                 continue;
                                             }
                                         }
                                         "SET" => {
-                                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content: Some(key) })) = array.messages.get(1) {
-                                                if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content: Some(value) })) = array.messages.get(2) {
+                                            if let Some(RedisMessage::BulkString(
+                                                RedisBulkStringMessage { content: Some(key) },
+                                            )) = array.messages.get(1)
+                                            {
+                                                if let Some(RedisMessage::BulkString(
+                                                    RedisBulkStringMessage {
+                                                        content: Some(value),
+                                                    },
+                                                )) = array.messages.get(2)
+                                                {
                                                     {
-                                                        state_clone.write().await.insert(key.clone(), value.clone());
+                                                        let insert_value =
+                                                            if let Some(RedisMessage::BulkString(
+                                                                RedisBulkStringMessage {
+                                                                    content: Some(expiry_string),
+                                                                },
+                                                            )) = array.messages.get(4)
+                                                            {
+                                                                let expiry =
+                                                                    u128::from_str(expiry_string)
+                                                                        .unwrap();
+                                                                ValueState::with_expiry(
+                                                                    value.clone(),
+                                                                    expiry,
+                                                                )
+                                                            } else {
+                                                                ValueState::no_expiry(value.clone())
+                                                            };
+                                                        state_clone
+                                                            .write()
+                                                            .await
+                                                            .insert(key.clone(), insert_value);
                                                     }
-                                                    println!("state_clone {:?}", state_clone.read().await);
-                                                    let reply = RedisMessage::BulkString("OK".to_string().into()).to_message();
+                                                    println!(
+                                                        "state_clone {:?}",
+                                                        state_clone.read().await
+                                                    );
+                                                    let reply = RedisMessage::BulkString(
+                                                        "OK".to_string().into(),
+                                                    )
+                                                    .to_message();
                                                     println!("Sending message {reply}");
-                                                    stream.write_all(reply.as_bytes()).await.unwrap();
+                                                    stream
+                                                        .write_all(reply.as_bytes())
+                                                        .await
+                                                        .unwrap();
                                                     continue;
                                                 }
                                             }
