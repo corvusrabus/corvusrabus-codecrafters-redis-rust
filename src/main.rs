@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::str::{from_utf8, FromStr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // Uncomment this block to pass the first stage
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub enum RedisMessage {
@@ -61,22 +64,34 @@ fn parse_length(slice: &[u8], start: usize) -> Result<(usize, usize), String> {
 
 #[derive(Debug, Clone)]
 pub struct RedisBulkStringMessage {
-    pub content: String,
+    pub content: Option<String>,
 }
+
 impl From<String> for RedisBulkStringMessage {
     fn from(content: String) -> Self {
-        Self{ content }
+        Self { content: Some(content) }
     }
 }
+
+impl From<Option<String>> for RedisBulkStringMessage {
+    fn from(content: Option<String>) -> Self {
+        Self { content }
+    }
+}
+
 impl RedisBulkStringMessage {
     fn to_message(&self) -> String {
-        let len = self.content.len();
-        format!("${len}\r\n{}\r\n",self.content)
+        match self.content.as_ref() {
+            None => { "$-1\r\n\r\n".to_string() }
+            Some(x) => {
+                format!("${}\r\n{}\r\n", x.len(), x)
+            }
+        }
     }
     fn parse_slice(slice: &[u8], start: usize) -> Result<(Self, usize), String> {
         let (size, start) = parse_length(slice, start).unwrap();
         let string_end = start + size;
-        let content = from_utf8(&slice[start..string_end]).unwrap().to_string();
+        let content = Some(from_utf8(&slice[start..string_end]).unwrap().to_string());
         Ok((Self { content }, string_end + 2))
     }
 }
@@ -88,7 +103,6 @@ pub struct RedisArrayMessage {
 
 impl RedisArrayMessage {
     fn to_message(&self) -> String {
-
         todo!()
     }
     fn parse_slice(slice: &[u8], start: usize) -> Result<(Self, usize), String> {
@@ -114,32 +128,65 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     //
     let mut buf = [0; 512];
+    let state: Arc<RwLock<HashMap<String, String>>> = Default::default();
     loop {
         let stream = listener.accept().await;
         match stream {
             Ok((mut stream, _)) => {
                 println!("accepted new connection");
-                tokio::spawn(async move {
-                    while let Ok(size) = stream.read(&mut buf).await {
-                        // println!("{}", from_utf8(&buf[..size]).unwrap());
-                        let (rcvd_msg, _) = RedisMessage::parse_slice(&buf[..size], 0).unwrap();
-                        println!("{rcvd_msg:?}");
-                        if let RedisMessage::Array(array) = rcvd_msg {
-                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content })) = array.messages.first() {
-                                if content.to_uppercase().as_str() == "ECHO" {
-                                    if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content })) = array.messages.get(1) {
-                                        let reply = RedisMessage::BulkString(content.clone().into()).to_message();
-                                        println!("Sending message {reply}");
-                                        stream.write_all(reply.as_bytes()).await.unwrap();
-                                        continue;
+                tokio::spawn({
+                    let state_clone = state.clone();
+                    async move {
+                        while let Ok(size) = stream.read(&mut buf).await {
+                            // println!("{}", from_utf8(&buf[..size]).unwrap());
+                            let (rcvd_msg, _) = RedisMessage::parse_slice(&buf[..size], 0).unwrap();
+                            println!("{rcvd_msg:?}");
+                            if let RedisMessage::Array(array) = rcvd_msg {
+                                if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content })) = array.messages.first() {
+                                    match content.as_ref().unwrap().to_uppercase().as_str() {
+                                        "ECHO" => {
+                                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content })) = array.messages.get(1) {
+                                                let reply = RedisMessage::BulkString(content.clone().into()).to_message();
+                                                println!("Sending message {reply}");
+                                                stream.write_all(reply.as_bytes()).await.unwrap();
+                                                continue;
+                                            }
+                                        }
+                                        "GET" => {
+                                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content: Some(x) })) = array.messages.get(1) {
+                                                let value = {
+                                                    state_clone.read().await.get(x).cloned()
+                                                };
+                                                println!("state_clone {:?}", state_clone.read().await);
+                                                let reply = RedisMessage::BulkString(value.into()).to_message();
+                                                println!("Sending message {reply}");
+                                                stream.write_all(reply.as_bytes()).await.unwrap();
+                                                continue;
+                                            }
+                                        }
+                                        "SET" => {
+                                            if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content: Some(key) })) = array.messages.get(1) {
+                                                if let Some(RedisMessage::BulkString(RedisBulkStringMessage { content: Some(value) })) = array.messages.get(2) {
+                                                    {
+                                                        state_clone.write().await.insert(key.clone(), value.clone());
+                                                    }
+                                                    println!("state_clone {:?}", state_clone.read().await);
+                                                    let reply = RedisMessage::BulkString("OK".to_string().into()).to_message();
+                                                    println!("Sending message {reply}");
+                                                    stream.write_all(reply.as_bytes()).await.unwrap();
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
+                            // let rcved = from_utf8(&buf[..size]).unwrap();
+                            // println!("Received {rcved}");
+                            let msg = "+PONG\r\n".as_bytes();
+                            stream.write_all(msg).await.unwrap();
                         }
-                        // let rcved = from_utf8(&buf[..size]).unwrap();
-                        // println!("Received {rcved}");
-                        let msg = "+PONG\r\n".as_bytes();
-                        stream.write_all(msg).await.unwrap();
                     }
                 });
             }
